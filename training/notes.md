@@ -24,10 +24,18 @@ Raw annotation format per line (comma separated):
 
 | Step | Script | Purpose |
 |------|--------|---------|
+| 0 | `tui.py` | Interactive Terminal User Interface for unified pipeline control |
 | 1 | `prepare_dataset.py` | VisDrone txt -> YOLO labels + `data.yaml` |
 | 2 | `train.py` | Train YOLO11n |
 | 3 | `export.py` | Export / quantize for the Pi (NCNN / ONNX int8) |
 | 4 | `inference.py` | Run video -> annotated bounding-box video |
+---
+
+## Quick Start: Unified TUI
+```bash
+python training/tui.py
+```
+An interactive menu to trigger dataset preparation, multi-stage training, quantization/export, hardware simulation benchmarks, and video inference.
 
 ---
 
@@ -50,19 +58,43 @@ Notes:
 
 ## 2. Train
 ```bash
-python training/train.py --epochs 100 --batch 16 --imgsz 640
+python training/train.py --epochs 100 --imgsz 512   # batch=-1, freeze=10, single-cls are defaults
 ```
-Defaults: starts from `yolo11n.pt` (COCO-pretrained -> much faster
-convergence and better results than training from scratch). Device auto-selects
-CUDA if the dev machine has a GPU (`torch.cuda.is_available()` was True).
+Defaults (implemented in `train.py`) are tuned for the dev machine's **4 GB RTX 3050**:
+- `--batch -1` auto-selects the largest batch that fits VRAM (fixes the OOM that killed
+  earlier runs; a fixed `batch 16 @ imgsz 640` was too big for 4 GB).
+- `--freeze 10` keeps the COCO-pretrained backbone frozen during the first stage — a
+  fast, high-quality fine-tune (the model already knows `person`).
+- `--single-cls` on by default (single `human` class).
+- `--workers 8` keeps the dataloader from bottlenecking 12 CPU cores.
 
-Other knobs:
+Recommended workflow:
+1. **Smoke test first** (a couple of minutes): `--epochs 3 --fraction 0.2 --profile`
+   to validate the pipeline and see the GPU vs data-loading split.
+2. **Stage 1 (frozen backbone):** `--freeze 10 --epochs 40 --imgsz 512 --single-cls`
+3. **Stage 2 (unfreeze):** `--freeze 0 --epochs 40 --imgsz 512 --single-cls --cos-lr \
+     --weights <stage1>/weights/best.pt`
+
+Other knobs (all exposed by `training/train.py`):
 - `--epochs` (start at 100; more = better but slower).
-- `--batch` raise on strong GPU (16/32/64), lower if CPU OOM.
-- `--imgsz`: train at 640 for accuracy. For an edge model you can train at
-  416 to match the deployment size (a "ladder" trick: train 640, then
-  fine-tune a few epochs at 416 before exporting).
-- `--patience` early-stops if val mAP stops improving.
+- `--imgsz`: train lower (416/512) on the 4 GB GPU to fit a bigger batch + iterate
+  faster; matches the 416 deployment size. For tiny far-away people use the "ladder"
+  trick (a few epochs at 640, then fine-tune at 416).
+- `--batch`: raise on strong GPU (16/32/64), or `-1` to auto-fit VRAM (default).
+- `--freeze N`: freeze the first N layers (default 10). `--freeze 0` disables
+  freezing (fine-tune everything in Stage 2).
+- `--single-cls` / `--no-single-cls`: single-class training (default on; the
+  dataset has one `human` class).
+- `--fraction F`: train on a fraction of the dataset (e.g. `0.2`) for a fast
+  smoke test before the full run (default 1.0).
+- `--profile`: print a GPU vs data-loading breakdown so you know what to tune.
+- `--cos-lr`: cosine LR schedule for smoother convergence.
+- `--close-mosaic N`: disable the (CPU-heavy) mosaic augmentation for the final
+  N epochs (default 10). Raise N if the dataloader is the bottleneck.
+- `--channels-last`, `--multiscale`: optional CUDA speed/quality levers —
+  `channels_last` is a small VRAM/speed win, `multiscale` raises VRAM. Note the
+  ultralytics engine arg is spelled `multi_scale` (mapped from this flag).
+- `--patience`: early-stops if val mAP stops improving (default 30).
 
 Output: `runs/detect/train/weights/best.pt` (best val mAP) and `last.pt`.
 

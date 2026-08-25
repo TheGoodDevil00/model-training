@@ -40,8 +40,8 @@ from ultralytics import YOLO
 
 def parse_args():
     p = argparse.ArgumentParser(description="Export YOLO11n for Raspberry Pi 5 deployment")
-    p.add_argument("--model", type=str, required=True,
-                   help="Trained weights, e.g. runs/detect/train/weights/best.pt")
+    p.add_argument("--model", type=str, default="runs/detect/train/weights/best.pt",
+                   help="Trained weights (default: runs/detect/train/weights/best.pt)")
     p.add_argument("--format", type=str, default="ncnn", choices=["ncnn", "onnx"],
                    help="Export format. ncnn = recommended for RPi 5 (ARM NEON).")
     p.add_argument("--imgsz", type=int, default=416,
@@ -58,21 +58,47 @@ def parse_args():
 
 def main():
     args = parse_args()
-    model = YOLO(args.model)
+    model_path = Path(args.model)
+    if not model_path.exists():
+        # Try common fallback paths if default or user path wasn't found directly
+        fallbacks = [
+            Path("runs/detect/train/weights/best.pt"),
+            Path("runs/detect/runs/detect/train/weights/best.pt"),
+            Path("yolo11n.pt"),
+        ]
+        found = None
+        for fb in fallbacks:
+            if fb.exists():
+                found = fb
+                break
+        if found:
+            print(f"[export] Warning: specified model '{args.model}' not found, falling back to '{found}'")
+            model_path = found
+        else:
+            raise FileNotFoundError(
+                f"Model weights file not found: '{args.model}'. "
+                f"Please train a model first using `python training/train.py` or specify valid weights."
+            )
 
+    model = YOLO(str(model_path))
     if args.int8 and not args.data:
         print("[export] WARNING: int8 quantization wants --data to calibrate; "
               "continuing with default calibration set.")
 
-    out = model.export(
-        format=args.format,
-        imgsz=args.imgsz,
-        half=args.half,
-        int8=args.int8,
-        data=args.data if args.int8 else None,
-        dynamic=args.dynamic,
-        simplify=args.simplify,
-    )
+    export_kwargs = {
+        "format": args.format,
+        "imgsz": args.imgsz,
+        "half": args.half,
+        "int8": args.int8,
+    }
+    if args.int8 and args.data:
+        export_kwargs["data"] = args.data
+    if args.dynamic:
+        export_kwargs["dynamic"] = True
+    if args.simplify and args.format == "onnx":
+        export_kwargs["simplify"] = True
+
+    out = model.export(**export_kwargs)
     print(f"\n[export] done -> {out}")
 
     if args.format == "ncnn":
