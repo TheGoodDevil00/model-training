@@ -5,19 +5,20 @@ tui.py
 Unified Terminal User Interface (TUI) for the Rescue Swarm Human Detector pipeline.
 
 Consolidates all dataset preparation, model training, edge export, performance evaluation,
-and video inference workflows into a single interactive terminal menu with real-time
-hardware telemetry monitoring (CPU, RAM, GPU VRAM, and Temperatures).
+video inference, dataset health diagnostics, and training metrics inspection into a single
+interactive terminal workstation with real-time hardware telemetry and RPi 5 simulation.
 
 Usage:
     python training/tui.py
 """
 
-import sys
 import os
-import subprocess
+import sys
 import shutil
+import subprocess
 import threading
 import time
+import select
 from pathlib import Path
 
 # Add project root to path
@@ -48,92 +49,176 @@ if _target_py != sys.executable and Path(_target_py).exists() and not os.environ
 
 DATASET_DIR = PROJECT_ROOT / "datasets" / "usable" / "yolo-human"
 DEFAULT_WEIGHTS = PROJECT_ROOT / "runs" / "detect" / "train" / "weights" / "best.pt"
+LAST_WEIGHTS = PROJECT_ROOT / "runs" / "detect" / "train" / "weights" / "last.pt"
 BASE_WEIGHTS = PROJECT_ROOT / "yolo11n.pt"
 
-# ANSI Terminal Color Helpers
+# ANSI Terminal Styling Constants
 BOLD = "\033[1m"
-GREEN = "\033[32m"
-CYAN = "\033[36m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
 DIM = "\033[2m"
+ITALIC = "\033[3m"
+UNDERLINE = "\033[4m"
 RESET = "\033[0m"
 
+# Foreground Colors
+GREEN = "\033[38;5;82m"
+BRIGHT_GREEN = "\033[38;5;120m"
+CYAN = "\033[38;5;51m"
+BLUE = "\033[38;5;75m"
+YELLOW = "\033[38;5;220m"
+RED = "\033[38;5;196m"
+MAGENTA = "\033[38;5;207m"
+WHITE = "\033[38;5;255m"
+GRAY = "\033[38;5;244m"
+DARK_GRAY = "\033[38;5;238m"
+
+# Background Highlights
+BG_DARK = "\033[48;5;236m"
+BG_BLUE = "\033[48;5;24m"
+BG_CYAN = "\033[48;5;30m"
+INVERSE = "\033[7m"
+
+
+def render_bar(pct: float, width: int = 12) -> str:
+    """Renders a high-resolution colored progress/utilization bar."""
+    pct = max(0.0, min(100.0, pct))
+    filled_len = int(round(width * (pct / 100.0)))
+    empty_len = width - filled_len
+
+    if pct >= 85.0:
+        bar_color = RED
+    elif pct >= 65.0:
+        bar_color = YELLOW
+    else:
+        bar_color = GREEN
+
+    filled = "█" * filled_len
+    empty = "░" * empty_len
+    return f"{bar_color}[{filled}{empty}]{RESET} {pct:4.1f}%"
+
 
 # --------------------------------------------------------------------------- #
-# System Telemetry & Hardware Stats
+# System Telemetry & Hardware Monitoring Engine
 # --------------------------------------------------------------------------- #
 
-def get_system_stats():
-    """Queries current CPU, RAM, GPU, VRAM, and thermal sensors."""
-    stats = {}
+_STATS_CACHE = None
+_STATS_TIME = 0.0
+_PIPELINE_CACHE = None
+_PIPELINE_TIME = 0.0
 
-    # 1. RAM Usage
-    try:
-        with open("/proc/meminfo", "r") as f:
-            lines = f.readlines()
-        mem_info = {}
-        for line in lines:
-            parts = line.split(":")
-            if len(parts) == 2:
-                mem_info[parts[0].strip()] = int(parts[1].split()[0])
-        total_mb = mem_info.get("MemTotal", 0) // 1024
-        avail_mb = mem_info.get("MemAvailable", 0) // 1024
-        used_mb = total_mb - avail_mb
-        pct = (used_mb / total_mb * 100) if total_mb else 0
-        stats["ram"] = f"{used_mb / 1024:.1f} / {total_mb / 1024:.1f} GB ({pct:.0f}%)"
-    except Exception:
-        stats["ram"] = "N/A"
 
-    # 2. CPU Load
+def get_system_stats(force: bool = False):
+    """Queries current CPU, RAM, Disk, GPU, VRAM, and thermal sensors with TTL caching."""
+    global _STATS_CACHE, _STATS_TIME
+    now = time.time()
+    if not force and _STATS_CACHE is not None and (now - _STATS_TIME) < 2.5:
+        return _STATS_CACHE
+
+    stats = {
+        "cpu_pct": 0.0,
+        "cpu_str": "N/A",
+        "cpu_temp": "N/A",
+        "ram_str": "N/A",
+        "ram_pct": 0.0,
+        "disk_str": "N/A",
+        "disk_pct": 0.0,
+    }
+    # 1. CPU & RAM & Disk via psutil if available
     try:
+        import psutil
+        # CPU
+        cpu_pct = psutil.cpu_percent(interval=None)
         load1, _, _ = os.getloadavg()
-        cpu_count = os.cpu_count() or 1
-        cpu_pct = min(100.0, (load1 / cpu_count) * 100)
-        stats["cpu"] = f"{cpu_pct:.0f}% (Load: {load1:.2f})"
-    except Exception:
-        stats["cpu"] = "N/A"
+        stats["cpu_pct"] = cpu_pct
+        stats["cpu_str"] = f"{cpu_pct:4.1f}% (load: {load1:.2f})"
 
-    # 3. CPU Temperature
-    try:
-        cpu_temps = []
-        for zone in Path("/sys/class/thermal").glob("thermal_zone*/temp"):
-            try:
-                t = int(zone.read_text().strip()) / 1000.0
-                if 20 <= t <= 110:
-                    cpu_temps.append(t)
-            except Exception:
-                pass
-        if cpu_temps:
-            stats["cpu_temp"] = f"{max(cpu_temps):.1f}°C"
-        else:
-            stats["cpu_temp"] = "N/A"
-    except Exception:
-        stats["cpu_temp"] = "N/A"
+        # RAM
+        vm = psutil.virtual_memory()
+        used_gb = (vm.total - vm.available) / (1024 ** 3)
+        total_gb = vm.total / (1024 ** 3)
+        stats["ram_pct"] = vm.percent
+        stats["ram_str"] = f"{used_gb:.1f} / {total_gb:.1f} GB"
 
-    # 4. NVIDIA GPU Stats (nvidia-smi)
+        # Disk (Project Root)
+        du = psutil.disk_usage(str(PROJECT_ROOT))
+        d_used = du.used / (1024 ** 3)
+        d_total = du.total / (1024 ** 3)
+        stats["disk_pct"] = du.percent
+        stats["disk_str"] = f"{d_used:.1f} / {d_total:.1f} GB"
+
+        # CPU Temp via psutil sensors
+        try:
+            temps = psutil.sensors_temperatures()
+            for key in ("k10temp", "coretemp", "cpu_thermal", "acpitz"):
+                if key in temps and temps[key]:
+                    stats["cpu_temp"] = f"{temps[key][0].current:.1f}°C"
+                    break
+        except Exception:
+            pass
+    except Exception:
+        # Fallback to /proc
+        try:
+            with open("/proc/meminfo", "r") as f:
+                mem_lines = f.readlines()
+            mem_info = {}
+            for line in mem_lines:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    mem_info[parts[0].strip()] = int(parts[1].split()[0])
+            total_mb = mem_info.get("MemTotal", 0) // 1024
+            avail_mb = mem_info.get("MemAvailable", 0) // 1024
+            used_mb = total_mb - avail_mb
+            pct = (used_mb / total_mb * 100) if total_mb else 0
+            stats["ram_pct"] = pct
+            stats["ram_str"] = f"{used_mb / 1024:.1f} / {total_mb / 1024:.1f} GB"
+        except Exception:
+            pass
+
+    # CPU Temperature Fallback
+    if stats["cpu_temp"] == "N/A":
+        try:
+            cpu_temps = []
+            for zone in Path("/sys/class/thermal").glob("thermal_zone*/temp"):
+                try:
+                    t = int(zone.read_text().strip()) / 1000.0
+                    if 20 <= t <= 110:
+                        cpu_temps.append(t)
+                except Exception:
+                    pass
+            if cpu_temps:
+                stats["cpu_temp"] = f"{max(cpu_temps):.1f}°C"
+        except Exception:
+            pass
+
+    # 2. NVIDIA GPU Stats (nvidia-smi)
     try:
         res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu,memory.used,memory.total,utilization.gpu",
+            ["nvidia-smi", "--query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.gpu,power.draw",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=1
+            capture_output=True, text=True, timeout=0.8
         )
         if res.returncode == 0 and res.stdout.strip():
             parts = [p.strip() for p in res.stdout.strip().split(",")]
-            if len(parts) >= 4:
-                g_temp, g_used, g_total, g_util = parts[:4]
+            if len(parts) >= 6:
+                g_name, g_temp, g_used, g_total, g_util, g_power = parts[:6]
+                used_vram = float(g_used)
+                total_vram = float(g_total)
+                vram_pct = (used_vram / total_vram * 100) if total_vram else 0
+                stats["gpu_name"] = g_name.replace("NVIDIA GeForce ", "")
                 stats["gpu_temp"] = f"{g_temp}°C"
-                stats["vram"] = f"{int(g_used) / 1024:.2f} / {int(g_total) / 1024:.2f} GB"
+                stats["vram_pct"] = vram_pct
+                stats["vram_str"] = f"{used_vram / 1024:.2f} / {total_vram / 1024:.2f} GB"
                 stats["gpu_util"] = f"{g_util}%"
+                stats["gpu_power"] = f"{float(g_power):.1f}W"
     except Exception:
         pass
 
+    _STATS_CACHE = stats
+    _STATS_TIME = now
     return stats
-
 
 class TelemetryThread(threading.Thread):
     """Background daemon updating the terminal window title bar with live stats."""
-    def __init__(self, interval=3.0):
+    def __init__(self, interval=2.5):
         super().__init__(daemon=True)
         self.interval = interval
         self.stop_event = threading.Event()
@@ -141,9 +226,9 @@ class TelemetryThread(threading.Thread):
     def run(self):
         while not self.stop_event.is_set():
             stats = get_system_stats()
-            vram_str = f" | VRAM: {stats['vram']}" if "vram" in stats else ""
+            vram_str = f" | VRAM: {stats['vram_str']}" if "vram_str" in stats else ""
             gpu_str = f" | GPU: {stats['gpu_temp']}" if "gpu_temp" in stats else ""
-            title = f"Swarm Pipeline | CPU: {stats.get('cpu', 'N/A')} ({stats.get('cpu_temp', 'N/A')}) | RAM: {stats.get('ram', 'N/A')}{gpu_str}{vram_str}"
+            title = f"Rescue Swarm Pipeline | CPU: {stats.get('cpu_str', 'N/A')} | RAM: {stats.get('ram_str', 'N/A')}{gpu_str}{vram_str}"
             try:
                 sys.stdout.write(f"\033]0;{title}\007")
                 sys.stdout.flush()
@@ -161,128 +246,567 @@ class TelemetryThread(threading.Thread):
 
 
 # --------------------------------------------------------------------------- #
-# UI Displays & Headers
+# Pipeline State & Workspace Introspection
 # --------------------------------------------------------------------------- #
 
-def print_banner():
-    """Prints status header, workspace state, and live hardware monitoring telemetry."""
-    os.system("clear" if os.name != "nt" else "cls")
-    print(f"{BOLD}{CYAN}========================================================================{RESET}")
-    print(f"{BOLD}{CYAN}      RESCUE SWARM: YOLO11n Human Detector - Unified Pipeline TUI       {RESET}")
-    print(f"{BOLD}{CYAN}========================================================================{RESET}\n")
+def get_pipeline_state(force: bool = False):
+    """Gathers status across dataset, training checkpoints, exports, and media with TTL caching."""
+    global _PIPELINE_CACHE, _PIPELINE_TIME
+    now = time.time()
+    if not force and _PIPELINE_CACHE is not None and (now - _PIPELINE_TIME) < 4.0:
+        return _PIPELINE_CACHE
 
-    # Workspace status indicators
-    dataset_ok = DATASET_DIR.exists() and (DATASET_DIR / "data.yaml").exists()
-    dataset_status = f"{GREEN}Ready ({DATASET_DIR.relative_to(PROJECT_ROOT)}){RESET}" if dataset_ok else f"{YELLOW}Not found (run Step 1){RESET}"
+    state = {}
+    data_yaml = DATASET_DIR / "data.yaml"
+    train_dir = DATASET_DIR / "train" / "images"
+    val_dir = DATASET_DIR / "val" / "images"
+    if data_yaml.exists() and train_dir.exists() and val_dir.exists():
+        try:
+            n_train = len(os.listdir(train_dir))
+            n_val = len(os.listdir(val_dir))
+            state["dataset_ok"] = True
+            state["dataset_desc"] = f"Ready ({n_train:,} train / {n_val:,} val images)"
+            state["n_train"] = n_train
+            state["n_val"] = n_val
+        except Exception:
+            state["dataset_ok"] = True
+            state["dataset_desc"] = f"Ready ({DATASET_DIR.relative_to(PROJECT_ROOT)})"
+    else:
+        state["dataset_ok"] = False
+        state["dataset_desc"] = "Not prepared (run Step 1)"
 
-    model_ok = DEFAULT_WEIGHTS.exists()
-    model_status = f"{GREEN}Found ({DEFAULT_WEIGHTS.relative_to(PROJECT_ROOT)}){RESET}" if model_ok else f"{YELLOW}Not trained yet{RESET}"
+    # 2. Model Checkpoint Status
+    csv_path = PROJECT_ROOT / "runs" / "detect" / "train" / "results.csv"
+    if DEFAULT_WEIGHTS.exists():
+        state["model_ok"] = True
+        train_info = "Found (best.pt)"
+        if csv_path.exists():
+            try:
+                import csv
+                with open(csv_path, mode="r") as f:
+                    rows = list(csv.DictReader(f))
+                if rows:
+                    headers = {k.strip(): k for k in rows[0].keys()}
+                    m50_key = headers.get("metrics/mAP50(B)")
+                    m95_key = headers.get("metrics/mAP50-95(B)")
+                    ep_key = headers.get("epoch")
+                    best_row = max(rows, key=lambda r: float(r[m50_key]) if r.get(m50_key) else 0)
+                    m50_val = float(best_row[m50_key]) * 100
+                    m95_val = float(best_row[m95_key]) * 100
+                    ep_val = best_row[ep_key].strip()
+                    total_ep = len(rows)
+                    train_info = f"Best mAP50: {m50_val:.1f}% | mAP50-95: {m95_val:.1f}% (ep {ep_val}/{total_ep})"
+                    state["best_map50"] = m50_val
+                    state["best_map95"] = m95_val
+                    state["epochs_done"] = total_ep
+            except Exception:
+                pass
+        state["model_desc"] = train_info
+    else:
+        state["model_ok"] = False
+        state["model_desc"] = "Not trained yet"
 
+    # 3. Edge Exports
     exports = list((PROJECT_ROOT / "runs").glob("**/*_ncnn_model")) + list((PROJECT_ROOT / "runs").glob("**/*.onnx"))
-    export_status = f"{GREEN}{len(exports)} exported model(s) found{RESET}" if exports else f"{DIM}None{RESET}"
+    state["exports"] = exports
+    if exports:
+        fmt_list = []
+        for exp in exports:
+            if "_ncnn_model" in exp.name:
+                size_mb = sum(f.stat().st_size for f in exp.glob("*")) / (1024 * 1024)
+                fmt_list.append(f"NCNN ({size_mb:.1f} MB)")
+            elif exp.suffix == ".onnx":
+                size_mb = exp.stat().st_size / (1024 * 1024)
+                fmt_list.append(f"ONNX ({size_mb:.1f} MB)")
+        state["export_desc"] = ", ".join(fmt_list)
+    else:
+        state["export_desc"] = "None"
 
-    py_in_use = get_python_exe()
-    stats = get_system_stats()
+    # 4. Input Media & Webcams
+    videos = list(PROJECT_ROOT.glob("*.mp4")) + list(PROJECT_ROOT.glob("*.avi")) + list(PROJECT_ROOT.glob("*.mkv"))
+    webcams = list(Path("/dev").glob("video*"))
+    state["videos"] = [str(v.relative_to(PROJECT_ROOT)) for v in videos]
+    state["webcams"] = [str(w) for w in webcams]
 
-    print(f"  {BOLD}Python Env:{RESET}     {CYAN}{py_in_use}{RESET}")
-    print(f"  {BOLD}Dataset Status:{RESET} {dataset_status}")
-    print(f"  {BOLD}Best Weights:{RESET}   {model_status}")
-    print(f"  {BOLD}Edge Exports:{RESET}   {export_status}")
-    print(f"{DIM}  ----------------------------------------------------------------------{RESET}")
-    print(f"  {BOLD}System & Hardware Telemetry Monitoring:{RESET}")
-    print(f"    • {BOLD}CPU Usage:{RESET}    {stats.get('cpu', 'N/A'):<18} |  {BOLD}CPU Temp:{RESET} {stats.get('cpu_temp', 'N/A')}")
-    print(f"    • {BOLD}RAM Memory:{RESET}   {stats.get('ram', 'N/A')}")
-    if "vram" in stats:
-        print(f"    • {BOLD}GPU (RTX 3050):{RESET} Util {stats.get('gpu_util', 'N/A'):<4} | VRAM {stats.get('vram', 'N/A'):<16} | Temp {stats.get('gpu_temp', 'N/A')}")
-    print(f"{DIM}------------------------------------------------------------------------{RESET}\n")
+    _PIPELINE_CACHE = state
+    _PIPELINE_TIME = now
+    return state
 
 
-def run_command(cmd_list):
-    """Executes a command array with live terminal output and background telemetry updates."""
-    cmd_str = " ".join(cmd_list)
-    print(f"\n{BOLD}{GREEN}Executing:{RESET} {cmd_str}\n")
+def discover_models():
+    """Finds all available PyTorch, NCNN, and ONNX models in workspace."""
+    models = []
 
-    # Log initial hardware snapshot
-    start_stats = get_system_stats()
-    gpu_snapshot = f" | GPU Temp: {start_stats['gpu_temp']} | VRAM: {start_stats['vram']}" if "vram" in start_stats else ""
-    print(f"{DIM}[Hardware Start Snapshot] RAM: {start_stats.get('ram', 'N/A')} | CPU: {start_stats.get('cpu', 'N/A')} ({start_stats.get('cpu_temp', 'N/A')}){gpu_snapshot}{RESET}")
-    print(f"{DIM}------------------------ [Output Stream Start] ------------------------{RESET}\n")
+    # 1. Best / Last weights
+    if DEFAULT_WEIGHTS.exists():
+        size_mb = DEFAULT_WEIGHTS.stat().st_size / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(DEFAULT_WEIGHTS.stat().st_mtime))
+        models.append({
+            "path": str(DEFAULT_WEIGHTS.relative_to(PROJECT_ROOT)),
+            "type": "PyTorch Checkpoint (Best Val mAP)",
+            "size": f"{size_mb:.1f} MB",
+            "time": mtime,
+            "recommended": True
+        })
 
-    # Launch background titlebar telemetry logger
-    monitor = TelemetryThread(interval=2.5)
-    monitor.start()
+    if LAST_WEIGHTS.exists():
+        size_mb = LAST_WEIGHTS.stat().st_size / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(LAST_WEIGHTS.stat().st_mtime))
+        models.append({
+            "path": str(LAST_WEIGHTS.relative_to(PROJECT_ROOT)),
+            "type": "PyTorch Checkpoint (Last Epoch)",
+            "size": f"{size_mb:.1f} MB",
+            "time": mtime,
+            "recommended": False
+        })
 
+    # 2. Exported NCNN models
+    for ncnn_dir in (PROJECT_ROOT / "runs").glob("**/*_ncnn_model"):
+        size_mb = sum(f.stat().st_size for f in ncnn_dir.glob("*")) / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(ncnn_dir.stat().st_mtime))
+        models.append({
+            "path": str(ncnn_dir.relative_to(PROJECT_ROOT)),
+            "type": "NCNN Model (RPi 5 ARM NEON Optimized)",
+            "size": f"{size_mb:.1f} MB",
+            "time": mtime,
+            "recommended": True
+        })
+
+    # 3. ONNX models
+    for onnx_file in (PROJECT_ROOT / "runs").glob("**/*.onnx"):
+        size_mb = onnx_file.stat().st_size / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(onnx_file.stat().st_mtime))
+        models.append({
+            "path": str(onnx_file.relative_to(PROJECT_ROOT)),
+            "type": "ONNX Runtime Model",
+            "size": f"{size_mb:.1f} MB",
+            "time": mtime,
+            "recommended": False
+        })
+
+    # 4. Base pretrained model
+    if BASE_WEIGHTS.exists():
+        size_mb = BASE_WEIGHTS.stat().st_size / (1024 * 1024)
+        models.append({
+            "path": str(BASE_WEIGHTS.relative_to(PROJECT_ROOT)),
+            "type": "Pretrained Base (COCO-80)",
+            "size": f"{size_mb:.1f} MB",
+            "time": "-",
+            "recommended": False
+        })
+
+    return models
+
+
+# --------------------------------------------------------------------------- #
+# Interactive Keyboard Navigation Engine
+# --------------------------------------------------------------------------- #
+
+def parse_escape_seq(seq: str) -> str:
+    """Decodes ANSI, VT100, xterm, Kitty, and DECCKM escape sequences."""
+    if not seq:
+        return "ESC"
+    # Standard ANSI & Application Cursor Keys (DECCKM / Kitty / tmux)
+    if seq in ("[A", "OA") or seq.endswith("A"):
+        return "UP"
+    if seq in ("[B", "OB") or seq.endswith("B"):
+        return "DOWN"
+    if seq in ("[C", "OC") or seq.endswith("C"):
+        return "RIGHT"
+    if seq in ("[D", "OD") or seq.endswith("D"):
+        return "LEFT"
+    # Kitty keyboard protocol (CSI unicode-key u)
+    if "57416" in seq:
+        return "UP"
+    if "57417" in seq:
+        return "DOWN"
+    if "57418" in seq:
+        return "RIGHT"
+    if "57419" in seq:
+        return "LEFT"
+    # Page Up / Down / Home / End
+    if "5~" in seq:
+        return "PAGE_UP"
+    if "6~" in seq:
+        return "PAGE_DOWN"
+    if "H" in seq or "1~" in seq:
+        return "HOME"
+    if "F" in seq or "4~" in seq:
+        return "END"
+    return "ESC"
+
+
+def read_key(fd: int) -> str:
+    """Reads a keypress from a raw file descriptor, consuming full escape bursts."""
     try:
-        res = subprocess.run(cmd_list, cwd=PROJECT_ROOT)
-        monitor.stop()
-        print(f"\n{DIM}------------------------- [Output Stream End] -------------------------{RESET}")
-        
-        end_stats = get_system_stats()
-        end_gpu = f" | GPU Temp: {end_stats['gpu_temp']} | VRAM: {end_stats['vram']}" if "vram" in end_stats else ""
-        print(f"{DIM}[Hardware Finish Snapshot] RAM: {end_stats.get('ram', 'N/A')} | CPU Temp: {end_stats.get('cpu_temp', 'N/A')}{end_gpu}{RESET}")
+        raw_byte = os.read(fd, 1)
+    except Exception:
+        return ""
+    if not raw_byte:
+        return ""
 
-        if res.returncode == 0:
-            print(f"\n{BOLD}{GREEN}Command completed successfully!{RESET}")
-        else:
-            print(f"\n{BOLD}{RED}Command failed with exit code {res.returncode}.{RESET}")
-    except KeyboardInterrupt:
-        monitor.stop()
-        print(f"\n{BOLD}{YELLOW}Process interrupted by user.{RESET}")
-    except Exception as e:
-        monitor.stop()
-        print(f"\n{BOLD}{RED}Error launching command: {e}{RESET}")
+    ch = raw_byte.decode("utf-8", errors="ignore")
+    if ch == "\x1b":
+        # Read any remaining bytes of the escape sequence burst
+        seq = ""
+        while True:
+            r, _, _ = select.select([fd], [], [], 0.02)
+            if not r:
+                break
+            chunk = os.read(fd, 32).decode("utf-8", errors="ignore")
+            if not chunk:
+                break
+            seq += chunk
+        return parse_escape_seq(seq)
+    elif ch in ("\r", "\n"):
+        return "ENTER"
+    elif ch in ("\x7f", "\x08"):
+        return "BACKSPACE"
+    elif ch == "\x03":  # Ctrl+C
+        raise KeyboardInterrupt
+    return ch
 
-    input(f"\n{DIM}Press Enter to return to the main menu...{RESET}")
 
+class TerminalSession:
+    """Manages terminal cbreak mode, alternate screen buffer, and cursor visibility."""
+    def __init__(self, alt_screen: bool = True):
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        self.old_settings = None
+        self.alt_screen = alt_screen
 
-def prompt_string(label, default=""):
-    prompt = f"  {label} [{default}]: " if default else f"  {label}: "
+    def __enter__(self):
+        if self.fd is not None:
+            import termios
+            import tty
+            self.old_settings = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+            # Enter alternate screen buffer & hide cursor for a crisp, isolated canvas
+            if self.alt_screen:
+                sys.stdout.write("\033[?1049h\033[2J\033[H\033[?25l")
+            else:
+                sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd is not None:
+            import termios
+            # Exit alternate screen buffer & restore cursor
+            if self.alt_screen:
+                sys.stdout.write("\033[?25h\033[?1049l")
+            else:
+                sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+            if self.old_settings is not None:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+
+def prompt_select_menu(title: str, options: list, default_idx: int = 0):
+    """
+    Renders an interactive menu allowing navigation with Arrow keys (Up/Down),
+    Vi keys (k/j), direct number keys (1-9), and Enter to confirm with zero flicker.
+    """
+    if not sys.stdin.isatty():
+        # Fallback to plain prompt in non-interactive environment
+        print(f"\n{BOLD}{title}{RESET}")
+        for i, opt in enumerate(options, 1):
+            lbl = opt.get("label", str(opt))
+            print(f"  {i}. {lbl}")
+        print("  0. Back / Cancel")
+        val = input(f"Select option [0-{len(options)}]: ").strip()
+        if val == "0" or not val:
+            return None
+        try:
+            idx = int(val) - 1
+            if 0 <= idx < len(options):
+                return options[idx].get("val", options[idx])
+        except Exception:
+            pass
+        return None
+
+    selected = default_idx
+    with TerminalSession(alt_screen=True) as session:
+        while True:
+            # Build screen buffer in memory (sub-millisecond)
+            lines = []
+            lines.extend(render_banner_lines())
+            lines.append(f"  {BOLD}{WHITE}╭─ {title} ─{'─' * max(0, 58 - len(title))}╮{RESET}")
+            lines.append(f"  {DIM}│  Use [↑/↓] or [j/k] to navigate, [Enter] or [1-{len(options)}] to select, [Esc/q/0] to cancel  │{RESET}")
+            lines.append(f"  {BOLD}{WHITE}├────────────────────────────────────────────────────────────────────────┤{RESET}")
+
+            for i, opt in enumerate(options):
+                lbl = opt.get("label", str(opt))
+                desc = opt.get("desc", "")
+                is_active = (i == selected)
+
+                key_num = str(i + 1) if i < 9 else "-"
+                if is_active:
+                    marker = f"{CYAN}▶{RESET}"
+                    line_str = f"  {marker} {BG_BLUE}{BOLD}{WHITE} [{key_num}] {lbl:<32}{RESET}"
+                    if desc:
+                        line_str += f" {DIM}{CYAN}← {desc}{RESET}"
+                else:
+                    marker = " "
+                    line_str = f"  {marker}   [{key_num}] {lbl:<32}"
+                    if desc:
+                        line_str += f" {DARK_GRAY}{desc}{RESET}"
+
+                lines.append(line_str)
+
+            lines.append(f"  {BOLD}{WHITE}╰────────────────────────────────────────────────────────────────────────╯{RESET}")
+            lines.append(f"  {DIM}[Esc / q / 0] Back to previous menu{RESET}")
+            lines.append("")
+            # Atomic render at cursor home with explicit \r\n to prevent any staircasing
+            buf = "\033[H" + "\r\n".join(lines) + "\r\n\033[J"
+            sys.stdout.write(buf)
+            sys.stdout.flush()
+
+            key = read_key(session.fd)
+
+            if key in ("UP", "k"):
+                selected = (selected - 1) % len(options)
+            elif key in ("DOWN", "j"):
+                selected = (selected + 1) % len(options)
+            elif key == "ENTER":
+                return options[selected].get("val", options[selected])
+            elif key in ("ESC", "q", "0"):
+                return None
+            elif key.isdigit():
+                idx = int(key) - 1
+                if 0 <= idx < len(options):
+                    return options[idx].get("val", options[idx])
+
+def prompt_string(label: str, default: str = "") -> str:
+    prompt = f"  {BOLD}{label}{RESET} [{CYAN}{default}{RESET}]: " if default else f"  {BOLD}{label}{RESET}: "
     val = input(prompt).strip()
     return val if val else default
 
 
-def prompt_int(label, default):
+def prompt_int(label: str, default: int) -> int:
     val = prompt_string(label, str(default))
     try:
         return int(val)
     except ValueError:
-        print(f"{RED}Invalid integer. Using default {default}{RESET}")
+        print(f"  {RED}Invalid integer. Using default {default}{RESET}")
         return default
 
 
-def prompt_float(label, default):
+def prompt_float(label: str, default: float) -> float:
     val = prompt_string(label, str(default))
     try:
         return float(val)
     except ValueError:
-        print(f"{RED}Invalid float. Using default {default}{RESET}")
+        print(f"  {RED}Invalid float. Using default {default}{RESET}")
         return default
 
+
+# --------------------------------------------------------------------------- #
+# Smart Asset & Media Pickers
+# --------------------------------------------------------------------------- #
+
+def pick_model(title: str = "Select Model Checkpoint", default_path: str = None) -> str:
+    """Interactively scans and lets the user pick from discovered models."""
+    models = discover_models()
+    options = []
+
+    for m in models:
+        rec_tag = f" {GREEN}(Recommended){RESET}" if m.get("recommended") else ""
+        options.append({
+            "label": m["path"],
+            "desc": f"{m['type']} [{m['size']}]{rec_tag}",
+            "val": m["path"]
+        })
+
+    options.append({
+        "label": "Custom Path...",
+        "desc": "Specify another file path or URL",
+        "val": "__CUSTOM__"
+    })
+
+    chosen = prompt_select_menu(title, options)
+    if not chosen:
+        return None
+    if chosen == "__CUSTOM__":
+        return prompt_string("Enter model file/folder path", default_path or str(DEFAULT_WEIGHTS))
+    return chosen
+
+
+def pick_media(title: str = "Select Input Media / Stream", default_src: str = "0") -> str:
+    """Interactively scans workspace and webcam devices for inference/evaluation."""
+    state = get_pipeline_state()
+    options = []
+
+    # Discovered Videos
+    for vid in state["videos"]:
+        try:
+            sz_mb = (PROJECT_ROOT / vid).stat().st_size / (1024 * 1024)
+            sz_str = f"{sz_mb:.1f} MB"
+        except Exception:
+            sz_str = "Video file"
+        options.append({
+            "label": vid,
+            "desc": f"Local workspace drone video [{sz_str}]",
+            "val": vid
+        })
+
+    # Webcams
+    if state["webcams"]:
+        for cam in state["webcams"]:
+            idx = cam.replace("/dev/video", "")
+            options.append({
+                "label": f"Webcam {cam}",
+                "desc": f"Live USB/V4L2 camera (source '{idx}')",
+                "val": idx
+            })
+    else:
+        options.append({
+            "label": "Webcam (default: 0)",
+            "desc": "Standard default video capture device index",
+            "val": "0"
+        })
+
+    options.append({
+        "label": "Custom Video Path / RTSP Stream...",
+        "desc": "Specify video filename or network stream URL",
+        "val": "__CUSTOM__"
+    })
+
+    chosen = prompt_select_menu(title, options)
+    if not chosen:
+        return None
+    if chosen == "__CUSTOM__":
+        return prompt_string("Enter video path, index, or RTSP URL", default_src)
+    return chosen
+
+
+# --------------------------------------------------------------------------- #
+# UI Displays, Header, & Execution Wrapper
+# --------------------------------------------------------------------------- #
+
+def render_banner_lines() -> list:
+    """Generates the banner, telemetry dashboard, and pipeline stepper as a list of lines."""
+    stats = get_system_stats()
+    state = get_pipeline_state()
+    lines = []
+
+    # 1. Header Box
+    lines.append(f"{BOLD}{CYAN}╭────────────────────────────────────────────────────────────────────────╮{RESET}")
+    lines.append(f"{BOLD}{CYAN}│      RESCUE SWARM: YOLO11n Human Detector - Unified Pipeline TUI       │{RESET}")
+    lines.append(f"{BOLD}{CYAN}╰────────────────────────────────────────────────────────────────────────╯{RESET}")
+
+    # 2. Live Hardware Telemetry Dashboard
+    cpu_bar = render_bar(stats["cpu_pct"], width=10)
+    ram_bar = render_bar(stats["ram_pct"], width=10)
+    disk_bar = render_bar(stats["disk_pct"], width=10)
+
+    lines.append(f"  {BOLD}Hardware Telemetry Dashboard:{RESET}")
+    lines.append(f"    • {BOLD}CPU Usage:{RESET}    {cpu_bar} {stats['cpu_str']:<16} {DIM}|{RESET} {BOLD}Temp:{RESET} {YELLOW}{stats['cpu_temp']}{RESET}")
+    lines.append(f"    • {BOLD}RAM Memory:{RESET}   {ram_bar} {stats['ram_str']}")
+    lines.append(f"    • {BOLD}Disk Space:{RESET}   {disk_bar} {stats['disk_str']} (workspace)")
+
+    if "vram_str" in stats:
+        vram_bar = render_bar(stats.get("vram_pct", 0), width=10)
+        gpu_name = stats.get("gpu_name", "GPU")
+        lines.append(f"    • {BOLD}GPU ({gpu_name}):{RESET} {vram_bar} {stats['vram_str']} {DIM}|{RESET} {stats.get('gpu_power', '')} {DIM}|{RESET} {YELLOW}{stats.get('gpu_temp', '')}{RESET}")
+
+    # 3. Target Deployment Reference
+    lines.append(f"  {DIM}─ Target Edge Spec: Raspberry Pi 5 (4x Cortex-A76 @ 2.4GHz, 4GB RAM, Target: ≥15 FPS) ─{RESET}")
+
+    # 4. Pipeline Lifecycle Stepper
+    lines.append("")
+    lines.append(f"  {BOLD}Pipeline Lifecycle Status:{RESET}")
+    # Step 1: Prep
+    prep_ico = f"{GREEN}✔{RESET}" if state["dataset_ok"] else f"{YELLOW}•{RESET}"
+    prep_txt = f"{GREEN}{state['dataset_desc']}{RESET}" if state["dataset_ok"] else f"{YELLOW}{state['dataset_desc']}{RESET}"
+    lines.append(f"    {prep_ico} {BOLD}[1. Prep Dataset]{RESET} {prep_txt}")
+
+    # Step 2: Model
+    model_ico = f"{GREEN}✔{RESET}" if state["model_ok"] else f"{YELLOW}•{RESET}"
+    model_txt = f"{GREEN}{state['model_desc']}{RESET}" if state["model_ok"] else f"{YELLOW}{state['model_desc']}{RESET}"
+    lines.append(f"    {model_ico} {BOLD}[2. Train Model ]{RESET} {model_txt}")
+
+    # Step 3: Export
+    exp_ico = f"{GREEN}✔{RESET}" if state["exports"] else f"{DIM}•{RESET}"
+    exp_txt = f"{GREEN}{state['export_desc']}{RESET}" if state["exports"] else f"{DIM}Pending export{RESET}"
+    lines.append(f"    {exp_ico} {BOLD}[3. Edge Export ]{RESET} {exp_txt}")
+
+    # Step 4 & 5: Inference / Eval
+    infer_ready = f"{GREEN}Ready ({len(state['videos'])} video(s), {len(state['webcams'])} camera(s)){RESET}"
+    lines.append(f"    {GREEN}✔{RESET} {BOLD}[4. Inference   ]{RESET} {infer_ready}")
+
+    lines.append(f"{DARK_GRAY}{'─' * 74}{RESET}")
+    return lines
+
+
+def print_banner():
+    """Prints status header and hardware telemetry with explicit CRLF."""
+    lines = render_banner_lines()
+    sys.stdout.write("\033[2J\033[H" + "\r\n".join(lines) + "\r\n")
+    sys.stdout.flush()
+
+def run_command(cmd_list: list, task_name: str = "Pipeline Task"):
+    """Executes a command array with live terminal output and hardware snapshots."""
+    cmd_str = " ".join(cmd_list)
+    print(f"\n{BOLD}{CYAN}╭─ Executing {task_name} ─{'─' * max(0, 52 - len(task_name))}╮{RESET}")
+    print(f"  {BOLD}Command:{RESET} {GREEN}{cmd_str}{RESET}")
+
+    start_stats = get_system_stats()
+    gpu_snapshot = f" | VRAM: {start_stats['vram_str']} | GPU: {start_stats['gpu_temp']}" if "vram_str" in start_stats else ""
+    print(f"  {DIM}[Hardware Start] CPU: {start_stats['cpu_str']} | RAM: {start_stats['ram_str']}{gpu_snapshot}{RESET}")
+    print(f"{BOLD}{CYAN}╰────────────────────────────────────────────────────────────────────────╯{RESET}\n")
+
+    monitor = TelemetryThread(interval=2.5)
+    monitor.start()
+    t0 = time.perf_counter()
+
+    try:
+        res = subprocess.run(cmd_list, cwd=PROJECT_ROOT)
+        monitor.stop()
+        elapsed = time.perf_counter() - t0
+
+        print(f"\n{DARK_GRAY}{'─' * 74}{RESET}")
+        end_stats = get_system_stats()
+        end_gpu = f" | VRAM: {end_stats['vram_str']} | GPU: {end_stats['gpu_temp']}" if "vram_str" in end_stats else ""
+        print(f"{DIM}[Hardware Finish in {elapsed:.1f}s] CPU: {end_stats['cpu_str']} | RAM: {end_stats['ram_str']}{end_gpu}{RESET}")
+
+        if res.returncode == 0:
+            print(f"\n{BOLD}{GREEN}✔ {task_name} completed successfully! ({elapsed:.1f}s){RESET}")
+        else:
+            print(f"\n{BOLD}{RED}✖ {task_name} failed with exit code {res.returncode}.{RESET}")
+    except KeyboardInterrupt:
+        monitor.stop()
+        print(f"\n{BOLD}{YELLOW}⚠ Process interrupted by user.{RESET}")
+    except Exception as e:
+        monitor.stop()
+        print(f"\n{BOLD}{RED}✖ Error launching command: {e}{RESET}")
+
+    get_system_stats(force=True)
+    get_pipeline_state(force=True)
+    input(f"\n{DIM}Press [Enter] to return to menu...{RESET}")
 
 # --------------------------------------------------------------------------- #
 # Menu Handlers
 # --------------------------------------------------------------------------- #
 
 def menu_prepare_dataset():
-    print_banner()
-    print(f"{BOLD}Step 1: Prepare VisDrone Dataset{RESET}\n")
-    print("  1. Default (Symlink images, keep negative frames)")
-    print("  2. Only frames with humans (--only-with-humans)")
-    print("  3. Copy images instead of symlinking (--copy)")
-    print("  4. Custom paths and options")
-    print("  0. Back")
+    """Step 1: Dataset conversion and options."""
+    options = [
+        {"label": "Standard Symlink (Recommended)", "desc": "Keep all frames (incl. negatives), symlink images to save disk", "val": "default"},
+        {"label": "Only Frames with Humans", "desc": "Filter out non-human negative frames (--only-with-humans)", "val": "humans_only"},
+        {"label": "Copy Images (Standalone)", "desc": "Physically copy images instead of symlinking (--copy)", "val": "copy"},
+        {"label": "Custom Split Paths", "desc": "Specify custom train/val/out directories", "val": "custom"},
+    ]
 
-    choice = input("\nSelect option [1-4]: ").strip()
-    if choice == "0" or not choice:
+    choice = prompt_select_menu("Step 1: Prepare VisDrone Dataset", options)
+    if not choice:
         return
 
     cmd = [get_python_exe(), "training/prepare_dataset.py"]
 
-    if choice == "2":
+    if choice == "humans_only":
         cmd.append("--only-with-humans")
-    elif choice == "3":
+    elif choice == "copy":
         cmd.append("--copy")
-    elif choice == "4":
+    elif choice == "custom":
         train_path = prompt_string("Train split dir", "datasets/usable/VisDrone2019-DET-train")
         val_path = prompt_string("Val split dir", "datasets/usable/VisDrone2019-DET-val")
         out_path = prompt_string("Output dir", "datasets/usable/yolo-human")
@@ -292,73 +816,86 @@ def menu_prepare_dataset():
         if input("  Only keep images with humans? (y/N): ").lower().startswith("y"):
             cmd.append("--only-with-humans")
 
-    run_command(cmd)
+    run_command(cmd, "Dataset Preparation")
 
 
 def menu_train():
-    print_banner()
-    print(f"{BOLD}Step 2: Train Model (YOLO11n){RESET}\n")
-    print("  1. Stage 1 Fine-Tune (Frozen backbone: 10 layers, 100 epochs, batch 16)")
-    print("  2. Stage 2 Fine-Tune (Unfreeze backbone, cosine LR, best weights, batch 16)")
-    print("  3. Quick Pipeline Smoke Test (3 epochs, batch 16, 0.2 fraction)")
-    print("  4. Custom Training Run")
-    print("  0. Back")
+    """Step 2: Model training workflows."""
+    options = [
+        {"label": "Stage 1: Frozen Backbone (Recommended)", "desc": "100 epochs, imgsz 512, freeze 10, batch -1 (auto-VRAM)", "val": "stage1"},
+        {"label": "Stage 2: Full Fine-Tune", "desc": "Unfreeze backbone (freeze 0), cosine LR, 40 epochs", "val": "stage2"},
+        {"label": "Quick Smoke Test", "desc": "3 epochs, 0.2 dataset fraction, batch 16, profiling", "val": "smoke"},
+        {"label": "Resume Interrupted Run", "desc": "Resume from runs/detect/train/weights/last.pt", "val": "resume"},
+        {"label": "Custom Training Run", "desc": "Configure epochs, batch, imgsz, freeze, LR manually", "val": "custom"},
+    ]
 
-    choice = input("\nSelect option [1-4]: ").strip()
-    if choice == "0" or not choice:
+    choice = prompt_select_menu("Step 2: Train Model (YOLO11n)", options)
+    if not choice:
         return
 
     cmd = [get_python_exe(), "training/train.py"]
 
-    if choice == "1":
-        cmd.extend(["--epochs", "100", "--batch", "16", "--imgsz", "512", "--freeze", "10", "--single-cls"])
-    elif choice == "2":
-        weights = str(DEFAULT_WEIGHTS) if DEFAULT_WEIGHTS.exists() else "yolo11n.pt"
-        weights_in = prompt_string("Pretrained weights path", weights)
-        cmd.extend(["--freeze", "0", "--epochs", "40", "--batch", "16", "--imgsz", "512", "--single-cls", "--cos-lr", "--weights", weights_in])
-    elif choice == "3":
+    if choice == "stage1":
+        # batch -1 auto-selects optimal VRAM batch on RTX 3050 per notes.md
+        cmd.extend(["--epochs", "100", "--batch", "-1", "--imgsz", "512", "--freeze", "10", "--single-cls"])
+    elif choice == "stage2":
+        default_pt = str(DEFAULT_WEIGHTS) if DEFAULT_WEIGHTS.exists() else "yolo11n.pt"
+        weights_in = pick_model("Select Base Checkpoint for Stage 2", default_pt)
+        if not weights_in:
+            return
+        cmd.extend(["--freeze", "0", "--epochs", "40", "--batch", "-1", "--imgsz", "512",
+                    "--single-cls", "--cos-lr", "--weights", weights_in])
+    elif choice == "smoke":
         cmd.extend(["--epochs", "3", "--batch", "16", "--fraction", "0.2", "--profile"])
-    elif choice == "4":
+    elif choice == "resume":
+        if not LAST_WEIGHTS.exists():
+            print(f"\n{RED}Error: No last.pt checkpoint found at {LAST_WEIGHTS.relative_to(PROJECT_ROOT)}{RESET}")
+            input("Press Enter to continue...")
+            return
+        cmd.extend(["--weights", str(LAST_WEIGHTS), "--epochs", "100", "--batch", "-1", "--imgsz", "512", "--single-cls"])
+    elif choice == "custom":
         epochs = prompt_int("Epochs", 100)
-        imgsz = prompt_int("Input resolution (px)", 512)
-        batch = prompt_int("Batch size", 16)
-        freeze = prompt_int("Frozen layers (10 = backbone, 0 = none)", 10)
-        weights = prompt_string("Weights checkpoint", "yolo11n.pt")
+        imgsz = prompt_int("Input resolution (px, divisible by 32)", 512)
+        batch = prompt_int("Batch size (-1 for auto-fit VRAM)", -1)
+        freeze = prompt_int("Frozen layers (10 = backbone, 0 = all)", 10)
+        weights = pick_model("Weights checkpoint", "yolo11n.pt")
+        if not weights:
+            return
         cmd.extend(["--epochs", str(epochs), "--imgsz", str(imgsz), "--batch", str(batch),
                     "--freeze", str(freeze), "--weights", weights])
         if input("  Enable Cosine LR schedule? (Y/n): ").lower() != "n":
             cmd.append("--cos-lr")
 
-    run_command(cmd)
+    run_command(cmd, "Model Training")
 
 
 def menu_export():
-    print_banner()
-    print(f"{BOLD}Step 3: Edge Export & Quantization (Raspberry Pi 5 Target){RESET}\n")
-    print("  1. NCNN FP16 (Fast & accurate for ARM NEON - Recommended)")
-    print("  2. NCNN INT8 (Calibrated ARM NEON quantization)")
-    print("  3. ONNX INT8 (Alternative ONNX runtime)")
-    print("  4. Custom Export")
-    print("  0. Back")
+    """Step 3: Edge export and quantization."""
+    options = [
+        {"label": "NCNN FP16 (ARM NEON - Recommended)", "desc": "Fastest runtime on RPi 5 Cortex-A76 (15-25+ FPS target)", "val": "ncnn_fp16"},
+        {"label": "NCNN INT8 (Quantized)", "desc": "Calibrated int8 quantization using data.yaml", "val": "ncnn_int8"},
+        {"label": "ONNX INT8 (Alternative)", "desc": "Optimized ONNX graph with int8 quantization", "val": "onnx_int8"},
+        {"label": "Custom Export", "desc": "Manually select format, resolution, and precision flags", "val": "custom"},
+    ]
 
-    choice = input("\nSelect option [1-4]: ").strip()
-    if choice == "0" or not choice:
+    choice = prompt_select_menu("Step 3: Edge Export & Quantization (RPi 5 Target)", options)
+    if not choice:
         return
 
-    weights = str(DEFAULT_WEIGHTS) if DEFAULT_WEIGHTS.exists() else "runs/detect/train/weights/best.pt"
-    model_path = prompt_string("Model checkpoint to export", weights)
-
+    model_path = pick_model("Select Checkpoint to Export", str(DEFAULT_WEIGHTS))
+    if not model_path:
+        return
     cmd = [get_python_exe(), "training/export.py", "--model", model_path]
 
-    if choice == "1":
+    if choice == "ncnn_fp16":
         cmd.extend(["--format", "ncnn", "--imgsz", "416", "--half"])
-    elif choice == "2":
+    elif choice == "ncnn_int8":
         data_path = prompt_string("Calibration data.yaml", "datasets/usable/yolo-human/data.yaml")
         cmd.extend(["--format", "ncnn", "--imgsz", "416", "--int8", "--data", data_path])
-    elif choice == "3":
+    elif choice == "onnx_int8":
         data_path = prompt_string("Calibration data.yaml", "datasets/usable/yolo-human/data.yaml")
         cmd.extend(["--format", "onnx", "--imgsz", "416", "--int8", "--data", data_path])
-    elif choice == "4":
+    elif choice == "custom":
         fmt = prompt_string("Format (ncnn / onnx)", "ncnn")
         imgsz = prompt_int("Input resolution (px)", 416)
         cmd.extend(["--format", fmt, "--imgsz", str(imgsz)])
@@ -369,85 +906,244 @@ def menu_export():
             data_path = prompt_string("Calibration data.yaml", "datasets/usable/yolo-human/data.yaml")
             cmd.extend(["--int8", "--data", data_path])
 
-    run_command(cmd)
+    run_command(cmd, "Edge Model Export")
 
 
 def menu_evaluate():
-    print_banner()
-    print(f"{BOLD}Step 4: RPi 5 Hardware Simulation & Evaluation{RESET}\n")
-    print("  1. Speed Benchmark (FPS / Latency sweep across resolutions)")
-    print("  2. Accuracy Benchmark (mAP50 / mAP50-95 on validation set)")
-    print("  0. Back")
+    """Step 4: Raspberry Pi 5 hardware simulation and benchmarking."""
+    options = [
+        {"label": "Speed Benchmark (Resolution & Format Sweep)", "desc": "Sweeps 640, 416, 352 with simulated 4 CPU threads & Pi 5 factor", "val": "speed"},
+        {"label": "Accuracy Benchmark (mAP50 / mAP50-95)", "desc": "Evaluates detection precision/recall/mAP on validation split", "val": "accuracy"},
+        {"label": "Quick 10-Frame RPi 5 Compliance Check", "desc": "Instant verification of >= 15 FPS target on movie.mp4", "val": "quick_check"},
+    ]
 
-    choice = input("\nSelect option [1-2]: ").strip()
-    if choice == "0" or not choice:
+    choice = prompt_select_menu("Step 4: RPi 5 Hardware Simulation & Evaluation", options)
+    if not choice:
         return
 
     cmd = [get_python_exe(), "training/eval/evaluate.py"]
 
-    if choice == "1":
+    if choice == "speed":
         cmd.append("speed")
-        default_model = str(DEFAULT_WEIGHTS) if DEFAULT_WEIGHTS.exists() else "runs/detect/train/weights/best.pt"
-        models_input = prompt_string("Models to benchmark (space-separated)", default_model)
-        video_input = prompt_string("Sample drone video path", "sample_drone.mp4")
+        model_path = pick_model("Select Model to Benchmark", str(DEFAULT_WEIGHTS))
+        if not model_path:
+            return
+        video_path = pick_media("Select Benchmark Video", "movie.mp4")
+        if not video_path:
+            return
         resolutions = prompt_string("Resolution sweep (comma-separated)", "640,416,352")
-        threads = prompt_int("Simulated CPU threads", 4)
-        
-        cmd.extend(["--models"] + models_input.split())
-        cmd.extend(["--video", video_input, "--imgsz", resolutions, "--threads", str(threads)])
-    elif choice == "2":
+        threads = prompt_int("Simulated RPi 5 CPU threads", 4)
+        frames = prompt_int("Frames to benchmark", 60)
+
+        cmd.extend(["--models", model_path, "--video", video_path,
+                    "--imgsz", resolutions, "--threads", str(threads), "--frames", str(frames)])
+    elif choice == "accuracy":
         cmd.append("accuracy")
-        default_model = str(DEFAULT_WEIGHTS) if DEFAULT_WEIGHTS.exists() else "runs/detect/train/weights/best.pt"
-        model_input = prompt_string("Model path", default_model)
+        model_path = pick_model("Select Model Checkpoint (.pt)", str(DEFAULT_WEIGHTS))
+        if not model_path:
+            return
         imgsz = prompt_int("Validation resolution (px)", 416)
         threads = prompt_int("Simulated CPU threads", 4)
-        cmd.extend(["--model", model_input, "--imgsz", str(imgsz), "--threads", str(threads)])
+        cmd.extend(["--model", model_path, "--imgsz", str(imgsz), "--threads", str(threads)])
+    elif choice == "quick_check":
+        cmd.append("speed")
+        # Try finding NCNN model first, otherwise PT
+        ncnn_models = list((PROJECT_ROOT / "runs").glob("**/*_ncnn_model"))
+        target_model = str(ncnn_models[0].relative_to(PROJECT_ROOT)) if ncnn_models else str(DEFAULT_WEIGHTS)
+        target_vid = "movie.mp4" if (PROJECT_ROOT / "movie.mp4").exists() else pick_media("Select Video")
+        if not target_vid:
+            return
+        cmd.extend(["--models", target_model, "--video", target_vid, "--imgsz", "416", "--frames", "15", "--threads", "4"])
 
-    run_command(cmd)
+    run_command(cmd, "Hardware Evaluation")
 
 
 def menu_inference():
-    print_banner()
-    print(f"{BOLD}Step 5: Run Video / Webcam Inference{RESET}\n")
-    
-    default_model = str(DEFAULT_WEIGHTS) if DEFAULT_WEIGHTS.exists() else "yolo11n.pt"
-    # Find exported models if present
-    exports = list((PROJECT_ROOT / "runs").glob("**/*_ncnn_model"))
-    if exports:
-        default_model = str(exports[0].relative_to(PROJECT_ROOT))
-
-    model_path = prompt_string("Model path (.pt or exported folder)", default_model)
-    input_src = prompt_string("Input video path or 0 for webcam", "0")
-    output_path = prompt_string("Output video path", "output_annotated.mp4")
-    imgsz = prompt_int("Inference input resolution (px)", 416)
+    """Step 5: Run real-time detection on video or webcam."""
+    model_path = pick_model("Select Detection Model (.pt or exported NCNN/ONNX)", str(DEFAULT_WEIGHTS))
+    if not model_path:
+        return
+    input_src = pick_media("Select Input Video Source or Camera", "movie.mp4")
+    if not input_src:
+        return
+    output_path = prompt_string("Output annotated video path", "output_annotated.mp4")
+    imgsz = prompt_int("Inference resolution (px, matching export)", 416)
     conf = prompt_float("Confidence threshold", 0.35)
+    cmd = [
+        get_python_exe(), "training/inference.py",
+        "--model", model_path,
+        "--input", input_src,
+        "--output", output_path,
+        "--imgsz", str(imgsz),
+        "--conf", str(conf)
+    ]
 
-    cmd = [get_python_exe(), "training/inference.py",
-           "--model", model_path,
-           "--input", input_src,
-           "--output", output_path,
-           "--imgsz", str(imgsz),
-           "--conf", str(conf)]
+    run_command(cmd, "Video Inference")
 
-    run_command(cmd)
+
+def menu_inspect_metrics():
+    """Step 6: Training Metrics & Run History Inspector."""
+    csv_path = PROJECT_ROOT / "runs" / "detect" / "train" / "results.csv"
+    args_yaml = PROJECT_ROOT / "runs" / "detect" / "train" / "args.yaml"
+
+    print_banner()
+    print(f"{BOLD}{WHITE}╭─ Training Run Metrics & History Inspector ─────────────────────────────╮{RESET}")
+
+    if not csv_path.exists():
+        print(f"  {YELLOW}No training run results found at runs/detect/train/results.csv{RESET}")
+        print(f"  Execute Step 2 (Model Training) to generate training results.")
+        print(f"{BOLD}{WHITE}╰────────────────────────────────────────────────────────────────────────╯{RESET}")
+        input(f"\n{DIM}Press Enter to return...{RESET}")
+        return
+
+    try:
+        import csv
+        with open(csv_path, mode="r") as f:
+            rows = list(csv.DictReader(f))
+
+        headers = {k.strip(): k for k in rows[0].keys()}
+        m50_key = headers.get("metrics/mAP50(B)")
+        m95_key = headers.get("metrics/mAP50-95(B)")
+        mp_key = headers.get("metrics/precision(B)")
+        mr_key = headers.get("metrics/recall(B)")
+        tbox_key = headers.get("train/box_loss")
+        tcls_key = headers.get("train/cls_loss")
+        vbox_key = headers.get("val/box_loss")
+        vcls_key = headers.get("val/cls_loss")
+        ep_key = headers.get("epoch")
+
+        total_epochs = len(rows)
+        best_row = max(rows, key=lambda r: float(r[m50_key]) if r.get(m50_key) else 0)
+        last_row = rows[-1]
+
+        print(f"  {BOLD}Training Run Summary:{RESET}")
+        print(f"    • Total Epochs Trained: {CYAN}{total_epochs}{RESET}")
+        print(f"    • Best Epoch:           {GREEN}Epoch {best_row[ep_key].strip()}{RESET}")
+        print(f"    • Best mAP50:           {GREEN}{float(best_row[m50_key])*100:.2f}%{RESET}")
+        print(f"    • Best mAP50-95:        {GREEN}{float(best_row[m95_key])*100:.2f}%{RESET}")
+        print(f"    • Precision (Best):     {float(best_row[mp_key])*100:.2f}%")
+        print(f"    • Recall (Best):        {float(best_row[mr_key])*100:.2f}%")
+        print(f"  {DIM}────────────────────────────────────────────────────────────────────────{RESET}")
+        print(f"  {BOLD}Final Epoch Losses (Epoch {last_row[ep_key].strip()}):{RESET}")
+        print(f"    • Train Loss: Box: {float(last_row[tbox_key]):.3f} | Cls: {float(last_row[tcls_key]):.3f}")
+        print(f"    • Val Loss:   Box: {float(last_row[vbox_key]):.3f} | Cls: {float(last_row[vcls_key]):.3f}")
+
+        # Show Hyperparameters if args.yaml exists
+        if args_yaml.exists():
+            try:
+                import yaml
+                with open(args_yaml) as yf:
+                    meta = yaml.safe_load(yf)
+                print(f"  {DIM}────────────────────────────────────────────────────────────────────────{RESET}")
+                print(f"  {BOLD}Run Hyperparameters:{RESET}")
+                print(f"    • Base Model: {meta.get('model', 'yolo11n.pt')} | ImgSz: {meta.get('imgsz')} | Batch: {meta.get('batch')}")
+                print(f"    • Freeze Backbone: {meta.get('freeze')} layers | Cosine LR: {meta.get('cos_lr')} | Single Class: {meta.get('single_cls')}")
+            except Exception:
+                pass
+
+        # Progress Sample Table (Last 5 epochs)
+        print(f"  {DIM}────────────────────────────────────────────────────────────────────────{RESET}")
+        print(f"  {BOLD}Recent Epoch Progression:{RESET}")
+        print(f"  {'Epoch':<8}{'mAP50':<12}{'mAP50-95':<12}{'Precision':<12}{'Recall':<12}{'Val Box Loss':<12}")
+        for r in rows[-5:]:
+            print(f"  {r[ep_key].strip():<8}"
+                  f"{float(r[m50_key])*100:>5.1f}%      "
+                  f"{float(r[m95_key])*100:>5.1f}%      "
+                  f"{float(r[mp_key])*100:>5.1f}%      "
+                  f"{float(r[mr_key])*100:>5.1f}%      "
+                  f"{float(r[vbox_key]):>6.3f}")
+
+    except Exception as e:
+        print(f"  {RED}Error reading training results: {e}{RESET}")
+
+    print(f"{BOLD}{WHITE}╰────────────────────────────────────────────────────────────────────────╯{RESET}")
+    input(f"\n{DIM}Press Enter to return...{RESET}")
+
+
+def menu_dataset_health():
+    """Step 7: Dataset Health & Integrity Check."""
+    print_banner()
+    print(f"{BOLD}{WHITE}╭─ Dataset Health & Integrity Verification ──────────────────────────────╮{RESET}")
+
+    data_yaml = DATASET_DIR / "data.yaml"
+    if not data_yaml.exists():
+        print(f"  {RED}Dataset not found at {DATASET_DIR.relative_to(PROJECT_ROOT)}{RESET}")
+        print(f"  Run Step 1 to prepare the VisDrone YOLO dataset.")
+        print(f"{BOLD}{WHITE}╰────────────────────────────────────────────────────────────────────────╯{RESET}")
+        input(f"\n{DIM}Press Enter to return...{RESET}")
+        return
+
+    train_img = DATASET_DIR / "train" / "images"
+    train_lbl = DATASET_DIR / "train" / "labels"
+    val_img = DATASET_DIR / "val" / "images"
+    val_lbl = DATASET_DIR / "val" / "labels"
+
+    n_tr_img = len(list(train_img.glob("*"))) if train_img.exists() else 0
+    n_tr_lbl = len(list(train_lbl.glob("*"))) if train_lbl.exists() else 0
+    n_va_img = len(list(val_img.glob("*"))) if val_img.exists() else 0
+    n_va_lbl = len(list(val_lbl.glob("*"))) if val_lbl.exists() else 0
+
+    print(f"  {BOLD}Split Integrity:{RESET}")
+    tr_match = f"{GREEN}Matched ({n_tr_img:,} pairs){RESET}" if (n_tr_img == n_tr_lbl and n_tr_img > 0) else f"{RED}Mismatch ({n_tr_img} imgs vs {n_tr_lbl} lbls){RESET}"
+    va_match = f"{GREEN}Matched ({n_va_img:,} pairs){RESET}" if (n_va_img == n_va_lbl and n_va_img > 0) else f"{RED}Mismatch ({n_va_img} imgs vs {n_va_lbl} lbls){RESET}"
+
+    print(f"    • Train Split: {tr_match}")
+    print(f"    • Val Split:   {va_match}")
+
+    # Inspect data.yaml
+    try:
+        import yaml
+        with open(data_yaml) as yf:
+            ymeta = yaml.safe_load(yf)
+        print(f"\n  {BOLD}Dataset Configuration (data.yaml):{RESET}")
+        print(f"    • Target Class: {GREEN}{ymeta.get('names', {0: 'human'})}{RESET}")
+        print(f"    • Train Path:   {ymeta.get('train')}")
+        print(f"    • Val Path:     {ymeta.get('val')}")
+    except Exception:
+        pass
+
+    # Quick sample annotation scan for class id confirmation
+    sample_lbls = list(train_lbl.glob("*.txt"))[:100]
+    total_boxes = 0
+    empty_frames = 0
+    class_ids = set()
+    for lp in sample_lbls:
+        text = lp.read_text().strip()
+        if not text:
+            empty_frames += 1
+            continue
+        for line in text.splitlines():
+            parts = line.split()
+            if parts:
+                class_ids.add(parts[0])
+                total_boxes += 1
+
+    print(f"\n  {BOLD}Annotation Quality Sample (first {len(sample_lbls)} frames):{RESET}")
+    print(f"    • Human Bounding Boxes: {CYAN}{total_boxes}{RESET}")
+    print(f"    • Negative Frames (no humans): {empty_frames} ({empty_frames/len(sample_lbls)*100:.0f}%)")
+    print(f"    • Detected Class IDs: {class_ids} (0 = single class 'human')")
+
+    print(f"{BOLD}{WHITE}╰────────────────────────────────────────────────────────────────────────╯{RESET}")
+    input(f"\n{DIM}Press Enter to return...{RESET}")
 
 
 # --------------------------------------------------------------------------- #
-# Main Loop
+# Main Application Loop
 # --------------------------------------------------------------------------- #
 
 def main():
-    while True:
-        print_banner()
-        print(f"{BOLD}Main Menu — Select Workflow:{RESET}\n")
-        print(f"  {CYAN}1.{RESET} 📁 Prepare Dataset         (VisDrone -> YOLO single-class format)")
-        print(f"  {CYAN}2.{RESET} 🏋️ Train Model             (YOLO11n fine-tuning & smoke test)")
-        print(f"  {CYAN}3.{RESET} 📦 Export & Quantize       (NCNN / ONNX int8/fp16 for RPi 5)")
-        print(f"  {CYAN}4.{RESET} 📊 Evaluate Performance    (RPi 5 hardware speed & accuracy simulation)")
-        print(f"  {CYAN}5.{RESET} 🎥 Video / Webcam Inference(Real-time detection & FPS monitoring)")
-        print(f"  {CYAN}0.{RESET} 🚪 Exit")
+    options = [
+        {"label": "📁 Prepare Dataset", "desc": "VisDrone raw -> YOLO single-class format", "val": "1"},
+        {"label": "🏋️ Train Model", "desc": "YOLO11n Stage 1/2 fine-tuning, resume, smoke test", "val": "2"},
+        {"label": "📦 Export & Quantize", "desc": "Convert to NCNN / ONNX (fp16 / int8) for RPi 5", "val": "3"},
+        {"label": "📊 Hardware Benchmark", "desc": "Simulate RPi 5 4-thread CPU throughput & accuracy", "val": "4"},
+        {"label": "🎥 Video / Live Inference", "desc": "Real-time bounding box detection & FPS monitoring", "val": "5"},
+        {"label": "📈 Inspect Training Metrics", "desc": "View mAP curves, loss progression & best epochs", "val": "6"},
+        {"label": "🩺 Dataset Health Check", "desc": "Verify split image/label pairing and annotations", "val": "7"},
+    ]
 
-        choice = input(f"\n{BOLD}Select an option [0-5]: {RESET}").strip()
+    while True:
+        choice = prompt_select_menu("Main Menu — Select Rescue Swarm Workflow", options)
 
         if choice == "1":
             menu_prepare_dataset()
@@ -459,8 +1155,12 @@ def main():
             menu_evaluate()
         elif choice == "5":
             menu_inference()
-        elif choice == "0" or choice.lower() in ("q", "quit", "exit"):
-            print(f"\n{GREEN}Exiting Rescue Swarm TUI. Goodbye!{RESET}\n")
+        elif choice == "6":
+            menu_inspect_metrics()
+        elif choice == "7":
+            menu_dataset_health()
+        elif choice is None:
+            print(f"\n{GREEN}Exiting Rescue Swarm Pipeline TUI. Fly safe!{RESET}\n")
             break
 
 
